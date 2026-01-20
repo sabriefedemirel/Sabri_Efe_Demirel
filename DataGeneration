@@ -1,0 +1,585 @@
+# ==========================================
+# Adana Urban LV (PyPSA) 
+# ==========================================
+# pip install pypsa pvlib pandas numpy matplotlib openpyxl
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import pypsa
+
+# ------------------------------
+# PVLIB import
+# ------------------------------
+try:
+    import pvlib
+    PVLIB_OK = True
+except Exception:
+    PVLIB_OK = False
+
+# ------------------------------
+# TIME SETTINGS
+# ------------------------------
+TZ = "Europe/Istanbul"
+START = "2025-07-01 00:00"
+END   = "2025-09-30 23:45"
+FREQ  = "5min"  # keep 5min as requested
+
+SNAP_TZ = pd.date_range(START, END, freq=FREQ, tz=TZ)
+SNAP = SNAP_TZ.tz_localize(None)  # PyPSA snapshot index tz-naive
+
+DT = pd.Timedelta(FREQ)
+DT_H = DT.total_seconds() / 3600.0            # 5min -> 0.083333...
+STEPS_PER_DAY = int(round(24.0 / DT_H))       # 5min -> 288
+T = len(SNAP)
+N_DAYS = int(np.ceil(T / STEPS_PER_DAY))
+
+# ------------------------------
+# 0) SETTINGS
+# ------------------------------
+N_HOUSES = 100
+
+# LV topology: 4 feeders x 5 bus = 20 bus + LV0
+N_FEEDERS = 4
+BUSES_PER_FEEDER = 5
+N_BUSES = N_FEEDERS * BUSES_PER_FEEDER  # LV1..LV20
+HOUSES_PER_BUS = N_HOUSES // N_BUSES    # 5
+
+PENETRATIONS = [0.20, 0.40, 0.60, 0.80]
+
+OV_LIM = 1.05
+UV_LIM = 0.95
+
+# Base (for pu conversion)
+V_LL_KV = 0.5
+S_BASE_MVA = 0.9
+Z_BASE_OHM = (V_LL_KV ** 2) / S_BASE_MVA  # ohm
+
+# Transformer equivalent (LV0 -> feeder start) pu
+TR_R_PU = 0.04
+TR_X_PU = 0.08
+
+# Cable model (reasonable for urban LV) + length range
+R_OHM_PER_KM = 0.40
+X_OHM_PER_KM = 0.08
+LEN_MIN_KM = 0.03
+LEN_MAX_KM = 0.15
+
+# Load PF
+PF = 0.95
+TANPHI = np.tan(np.arccos(PF))
+
+# Slack voltage setpoint
+SLACK_VSET = 1.01
+
+# PV inverter assumption: unity PF, no Volt-VAR control
+PV_Q_SET_ZERO = True
+
+# PV temp coefficient (PVWatts gamma_pdc), typical -0.4%/°C
+GAMMA_PDC = -0.004  # 1/°C
+
+SAVE_DATASET = True
+CSV_OUT = "adanurban_lv_dataset.csv"
+XLSX_OUT = "adanurban_lv_dataset.xlsx"
+
+# Representative day for 1-day zoom plots
+REP_DAY = "2025-07-15"
+
+# X axis mode for time-series plots
+# "readable": major 2h ticks + 15-min minor grid
+# "full15": labels each 15 minutes (works fine even if simulation is 5-min)
+XAXIS_MODE = "full15"  # or "readable"
+
+# ------------------------------
+# 1) BUS / HOUSE MAPPING
+# ------------------------------
+lv_bus_names = [f"LV{i+1}" for i in range(N_BUSES)]
+all_bus_names = ["LV0"] + lv_bus_names
+house_to_bus = np.repeat(np.arange(N_BUSES), HOUSES_PER_BUS)  # 0..19
+
+# ------------------------------
+# 2) TOPOLOGY (4 radial feeders)
+# ------------------------------
+rng_top = np.random.default_rng(123)
+
+feeder_buses = []
+for f in range(N_FEEDERS):
+    s = f * BUSES_PER_FEEDER
+    feeder_buses.append(list(range(s, s + BUSES_PER_FEEDER)))
+
+seg_len_km = rng_top.uniform(LEN_MIN_KM, LEN_MAX_KM, size=(N_FEEDERS, BUSES_PER_FEEDER))
+R_seg_pu = (R_OHM_PER_KM * seg_len_km) / Z_BASE_OHM
+X_seg_pu = (X_OHM_PER_KM * seg_len_km) / Z_BASE_OHM
+
+# ------------------------------
+# 3) LOAD PROFILES (house-level, MW)
+# ------------------------------
+def build_house_load_profiles() -> pd.DataFrame:
+    rng = np.random.default_rng(0)
+
+    hours = np.arange(T) * DT_H  # FIXED: uses real timestep size
+    # Evening peak residential shape
+    base = (np.sin((hours - 18) * np.pi / 12) + 1) / 2
+    base = 0.25 + 0.75 * base
+    base /= base.max()
+
+    dow = pd.Series(SNAP, index=SNAP).dt.dayofweek.values
+    weekend = np.where(dow >= 5, 1.08, 1.00)
+
+    daily = np.clip(rng.normal(1.0, 0.12, size=N_DAYS), 0.75, 1.35)
+
+    # House peak (kW)
+    peak_kw = rng.uniform(1.5, 5.0, size=N_HOUSES)
+
+    data = np.zeros((T, N_HOUSES))
+    for i in range(N_HOUSES):
+        noise = rng.normal(1.0, 0.06, size=T)
+        p_kw = np.clip(base * peak_kw[i] * weekend * noise, 0, None)
+
+        for d in range(N_DAYS):
+            s = d * STEPS_PER_DAY
+            e = min((d + 1) * STEPS_PER_DAY, T)
+            p_kw[s:e] *= daily[d]
+
+        data[:, i] = p_kw / 1000.0  # MW
+
+    return pd.DataFrame(data, index=SNAP, columns=[f"house_{i}" for i in range(N_HOUSES)])
+
+# ------------------------------
+# 4) METEO + PV PROFILES (house-level, MW)
+# ------------------------------
+def build_meteo_series():
+    """
+    Returns (poa_wm2, temp_air_c, wind_mps, temp_cell_c)
+    - POA from pvlib clearsky (Ineichen) + geometry (if PVLIB_OK)
+    - Ambient temperature & wind: synthetic but realistic for Adana summer
+    - Cell temperature: pvlib.temperature.faiman (if PVLIB_OK), else fallback
+    """
+    rng = np.random.default_rng(2025)
+
+    tt = np.arange(T)
+    hour = (tt % STEPS_PER_DAY) * DT_H  # FIXED: correct hour-of-day
+
+    # Air temperature: hot summer, peak ~15:00, min ~05:00
+    daily_shift = np.clip(rng.normal(0.0, 1.2, size=N_DAYS), -3.0, 3.0)
+    temp_air = 30.0 + 6.0 * np.sin((hour - 14.0) * np.pi / 12.0)
+    temp_air = temp_air.astype(float)
+
+    for d in range(N_DAYS):
+        s = d * STEPS_PER_DAY
+        e = min((d + 1) * STEPS_PER_DAY, T)
+        temp_air[s:e] += daily_shift[d]
+
+    temp_air += rng.normal(0.0, 0.5, size=T)
+    temp_air = np.clip(temp_air, 20.0, 45.0)
+    temp_air = pd.Series(temp_air, index=SNAP_TZ)
+
+    # Wind speed: low-moderate with noise
+    wind = 2.0 + 0.7 * np.sin((hour - 12.0) * np.pi / 12.0) + rng.normal(0.0, 0.3, size=T)
+    wind = np.clip(wind, 0.2, 6.0)
+    wind = pd.Series(wind, index=SNAP_TZ)
+
+    if PVLIB_OK:
+        lat, lon = 36.99, 35.33  # Adana approx.
+        loc = pvlib.location.Location(lat, lon, tz=TZ)
+
+        cs = loc.get_clearsky(SNAP_TZ, model="ineichen")
+        solpos = loc.get_solarposition(SNAP_TZ)
+
+        poa = pvlib.irradiance.get_total_irradiance(
+            surface_tilt=25,
+            surface_azimuth=180,
+            dni=cs["dni"], ghi=cs["ghi"], dhi=cs["dhi"],
+            solar_zenith=solpos["zenith"],
+            solar_azimuth=solpos["azimuth"],
+        )["poa_global"]
+
+        poa = poa.where(solpos["apparent_elevation"] > 0, 0.0).astype(float)
+
+        temp_cell = pvlib.temperature.faiman(poa_global=poa, temp_air=temp_air, wind_speed=wind)
+        return poa, temp_air, wind, temp_cell
+    else:
+        sun = np.maximum(0, np.sin((hour - 6) * np.pi / 12))
+        poa = 950.0 * sun
+        poa = pd.Series(poa, index=SNAP_TZ)
+
+        temp_cell = temp_air + 0.02 * poa - 1.5 * (wind - 2.0)
+        return poa, temp_air, wind, temp_cell
+
+def build_house_pv_profiles():
+    rng = np.random.default_rng(42)
+
+    rated_kw = rng.uniform(3.0, 7.0, size=N_HOUSES)
+
+    poa, temp_air, wind, temp_cell = build_meteo_series()
+
+    daily_scale = np.clip(np.random.default_rng(7).normal(1.0, 0.20, size=N_DAYS), 0.60, 1.25)
+
+    data = np.zeros((T, N_HOUSES))
+
+    poa_arr = poa.to_numpy()         # W/m2
+    tcell_arr = temp_cell.to_numpy() # C
+
+    for i in range(N_HOUSES):
+        cloud = rng.normal(1.0, 0.10, size=T)
+        irr_eff = np.clip(poa_arr * cloud, 0.0, None)
+
+        for d in range(N_DAYS):
+            s = d * STEPS_PER_DAY
+            e = min((d + 1) * STEPS_PER_DAY, T)
+            irr_eff[s:e] *= daily_scale[d]
+
+        pdc0_w = rated_kw[i] * 1000.0
+        if PVLIB_OK:
+            pv_w = pvlib.pvsystem.pvwatts_dc(
+                g_poa_effective=irr_eff,
+                temp_cell=tcell_arr,
+                pdc0=pdc0_w,
+                gamma_pdc=GAMMA_PDC
+            )
+        else:
+            pv_w = pdc0_w * (irr_eff / 1000.0) * (1.0 + GAMMA_PDC * (tcell_arr - 25.0))
+
+        pv_w = np.clip(np.asarray(pv_w, dtype=float), 0.0, None)
+        data[:, i] = pv_w / 1e6  # MW
+
+    PV_H = pd.DataFrame(data, index=SNAP, columns=[f"house_{i}" for i in range(N_HOUSES)])
+
+    meteo = pd.DataFrame({
+        "poa_wm2": poa.tz_localize(None).values,
+        "temp_air_c": temp_air.tz_localize(None).values,
+        "wind_mps": wind.tz_localize(None).values,
+        "temp_cell_c": temp_cell.tz_localize(None).values
+    }, index=SNAP)
+
+    return PV_H, meteo, rated_kw
+
+print("Building profiles ...")
+LOAD_H = build_house_load_profiles()
+PV_H, METEO, PV_RATED_KW = build_house_pv_profiles()
+
+# ------------------------------
+# 5) BUS-AGGREGATE LOAD
+# ------------------------------
+P_LOAD_BUS = pd.DataFrame(0.0, index=SNAP, columns=lv_bus_names)
+for h in range(N_HOUSES):
+    b = house_to_bus[h]
+    P_LOAD_BUS.iloc[:, b] += LOAD_H.iloc[:, h].to_numpy()
+
+Q_LOAD_BUS = P_LOAD_BUS * TANPHI
+
+# ------------------------------
+# 6) PV monotonic order (same houses kept when penetration increases)
+# ------------------------------
+pv_order = np.random.default_rng(999).permutation(np.arange(N_HOUSES))
+
+# ------------------------------
+# 7) BUILD PYPSA NETWORK
+# ------------------------------
+def build_base_network() -> pypsa.Network:
+    net = pypsa.Network()
+    net.set_snapshots(SNAP)
+
+    net.add("Bus", "LV0", v_nom=V_LL_KV)
+    for name in lv_bus_names:
+        net.add("Bus", name, v_nom=V_LL_KV)
+
+    net.add("Generator", "Slack", bus="LV0", control="Slack", p_nom=10.0)
+    net.generators.loc["Slack", "v_mag_pu_set"] = SLACK_VSET
+
+    # transformer equivalents (modelled as "Line" impedance between LV0 and feeder start)
+    for f in range(N_FEEDERS):
+        first_bus = feeder_buses[f][0]
+        net.add(
+            "Line", name=f"TX_F{f+1}", bus0="LV0", bus1=f"LV{first_bus+1}",
+            r=TR_R_PU, x=TR_X_PU, s_nom=10.0
+        )
+
+    # feeder segments
+    for f in range(N_FEEDERS):
+        buses = feeder_buses[f]
+        for si, b in enumerate(buses):
+            bus_name = f"LV{b+1}"
+            if si < len(buses) - 1:
+                b2 = buses[si+1]
+                net.add(
+                    "Line", name=f"F{f+1}_SEG{si+1}",
+                    bus0=bus_name, bus1=f"LV{b2+1}",
+                    r=float(R_seg_pu[f, si]), x=float(X_seg_pu[f, si]),
+                    s_nom=5.0
+                )
+
+    # loads + PV generators (per bus)
+    for bname in lv_bus_names:
+        net.add("Load", f"Load_{bname}", bus=bname, p_set=0.0, q_set=0.0)
+        net.add("Generator", f"PV_{bname}", bus=bname, control="PQ", p_nom=10.0)
+
+    # assign load time series
+    for bname in lv_bus_names:
+        net.loads_t.p_set[f"Load_{bname}"] = P_LOAD_BUS[bname].values
+        net.loads_t.q_set[f"Load_{bname}"] = Q_LOAD_BUS[bname].values
+
+    # PV inverter: unity PF (q=0)
+    if PV_Q_SET_ZERO:
+        for bname in lv_bus_names:
+            net.generators_t.q_set[f"PV_{bname}"] = np.zeros(T)
+
+    # Slack p_set=0 (slack balances)
+    net.generators_t.p_set["Slack"] = np.zeros(T)
+
+    return net
+
+def pv_bus_aggregate_for_penetration(p: float):
+    n_pv = int(round(p * N_HOUSES))
+    chosen = pv_order[:n_pv]
+    P_PV_BUS = pd.DataFrame(0.0, index=SNAP, columns=lv_bus_names)
+
+    for h in chosen:
+        b = house_to_bus[h]
+        P_PV_BUS.iloc[:, b] += PV_H.iloc[:, h].to_numpy()
+
+    return P_PV_BUS, chosen
+
+def run_scenario(p: float):
+    print(f"Running PF for PV penetration = {int(p*100)}% ...")
+    net = build_base_network()
+
+    P_PV_BUS, chosen = pv_bus_aggregate_for_penetration(p)
+    for bname in lv_bus_names:
+        net.generators_t.p_set[f"PV_{bname}"] = P_PV_BUS[bname].values
+
+    net.pf()
+
+    V_all = net.buses_t.v_mag_pu[all_bus_names].copy()
+    V_lv = V_all[lv_bus_names]
+    V0 = V_all["LV0"]
+
+    v_min = V_lv.min(axis=1)
+    v_max = V_lv.max(axis=1)
+
+    # system-indicator (any bus violates)
+    ov_any = (v_max > OV_LIM).astype(int)
+    uv_any = (v_min < UV_LIM).astype(int)
+
+    # FIXED: duration in hours = count * DT_H
+    ov_daily_h = pd.Series(ov_any, index=SNAP).resample("D").sum() * DT_H
+    uv_daily_h = pd.Series(uv_any, index=SNAP).resample("D").sum() * DT_H
+
+    # Optional (kept for analysis; not used elsewhere):
+    # bus-hours (severity)
+    # ov_buscount = (V_lv > OV_LIM).sum(axis=1)
+    # uv_buscount = (V_lv < UV_LIM).sum(axis=1)
+
+    return {
+        "v_min": v_min,
+        "v_max": v_max,
+        "V0": V0,
+        "ov_daily_h": ov_daily_h,
+        "uv_daily_h": uv_daily_h,
+        "chosen_pv_houses": chosen
+    }
+
+# ------------------------------
+# 8) RUN ALL SCENARIOS
+# ------------------------------
+results = {p: run_scenario(p) for p in PENETRATIONS}
+print("All scenarios completed.")
+
+# ------------------------------
+# 9) DATASET EXPORT
+# ------------------------------
+if SAVE_DATASET:
+    rows = []
+    total_load = P_LOAD_BUS.sum(axis=1)
+
+    poa_col = METEO["poa_wm2"]
+    tair_col = METEO["temp_air_c"]
+    tcell_col = METEO["temp_cell_c"]
+    wind_col = METEO["wind_mps"]
+
+    for p in PENETRATIONS:
+        P_PV_BUS, _ = pv_bus_aggregate_for_penetration(p)
+        total_pv = P_PV_BUS.sum(axis=1)
+
+        V0 = results[p]["V0"]
+        vmin = results[p]["v_min"]
+        vmax = results[p]["v_max"]
+
+        ov = (vmax > OV_LIM).astype(int)
+        uv = (vmin < UV_LIM).astype(int)
+
+        net_inj = total_pv - total_load
+
+        for t in SNAP:
+            rows.append({
+                "timestamp": t,
+                "pv_penetration": p,
+                "total_load_mw": float(total_load.loc[t]),
+                "total_pv_mw": float(total_pv.loc[t]),
+                "net_injection_mw": float(net_inj.loc[t]),
+                "lv0_v_pu": float(V0.loc[t]),
+                "vmin_lv_pu": float(vmin.loc[t]),
+                "vmax_lv_pu": float(vmax.loc[t]),
+                "over_voltage": int(ov.loc[t]),
+                "under_voltage": int(uv.loc[t]),
+                "poa_wm2": float(poa_col.loc[t]),
+                "temp_air_c": float(tair_col.loc[t]),
+
+
+            })
+
+    df = pd.DataFrame(rows)
+    df.to_csv(CSV_OUT, index=False)
+    df.to_excel(XLSX_OUT, index=False)
+    print(f"Dataset saved: {CSV_OUT} and {XLSX_OUT}")
+
+# ------------------------------
+# 10) PLOTS
+# ------------------------------
+day_start = pd.Timestamp(f"{REP_DAY} 00:00:00")
+day_end = day_start + pd.Timedelta(days=1) - DT  # FIXED: last timestep of that day
+mask_day = (SNAP >= day_start) & (SNAP <= day_end)
+
+def apply_time_axis(ax, mode: str):
+    if mode == "readable":
+        ax.xaxis.set_major_locator(mdates.HourLocator(interval=2))
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+        ax.xaxis.set_minor_locator(mdates.MinuteLocator(interval=15))
+        ax.grid(True, which="minor", linestyle=":", alpha=0.25)
+    elif mode == "full15":
+        ax.xaxis.set_major_locator(mdates.MinuteLocator(interval=15))
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+        ax.tick_params(axis="x", labelrotation=90, labelsize=7)
+    else:
+        raise ValueError("XAXIS_MODE must be 'readable' or 'full15'.")
+
+# 10.1) Voltage envelope (4 scenarios, 1-day)
+fig, axes = plt.subplots(2, 2, figsize=(18, 8), sharex=True, sharey=True)
+axes = axes.ravel()
+
+handles_for_global = None
+labels_for_global = None
+
+for ax, p in zip(axes, PENETRATIONS):
+    V0_day = results[p]["V0"].loc[mask_day]
+    vmin_day = results[p]["v_min"].loc[mask_day]
+    vmax_day = results[p]["v_max"].loc[mask_day]
+    t_day = V0_day.index
+
+    band = ax.fill_between(t_day, vmin_day.values, vmax_day.values, alpha=0.25)
+    l_v0,   = ax.plot(t_day, V0_day.values, linewidth=1.8)
+    l_vmax, = ax.plot(t_day, vmax_day.values, linewidth=1.2)
+    l_vmin, = ax.plot(t_day, vmin_day.values, linewidth=1.2)
+    l_ov = ax.axhline(OV_LIM, linestyle="--")
+    l_uv = ax.axhline(UV_LIM, linestyle="--")
+
+    ax.set_title(f"{int(p*100)}% PV (1-day zoom)")
+    ax.set_ylabel("V (p.u.)")
+    ax.grid(True, linestyle=":", alpha=0.8)
+
+    apply_time_axis(ax, XAXIS_MODE)
+
+    if handles_for_global is None:
+        handles_for_global = [band, l_v0, l_vmax, l_vmin, l_ov, l_uv]
+        labels_for_global = [
+            "Min–Max band (LV1..LV20)",
+            "LV0 (trafo çıkışı)",
+            "max(LV1..LV20)",
+            "min(LV1..LV20)",
+            f"OV limit {OV_LIM}",
+            f"UV limit {UV_LIM}",
+        ]
+
+for ax in axes:
+    ax.set_xlabel("")
+
+fig.suptitle(f"Adana Urban LV — Bus Voltage Envelope (4 scenarios, 1-day, {FREQ})", y=0.98)
+fig.legend(handles_for_global, labels_for_global,
+           loc="upper center", bbox_to_anchor=(0.5, 0.94), ncol=3, frameon=True)
+fig.tight_layout(rect=[0.02, 0.03, 0.98, 0.88])
+plt.show()
+
+# 10.2) Monthly OV / UV durations (Jul, Aug, Sep) — separate figures
+MONTHS = [(2025, 7), (2025, 8), (2025, 9)]
+
+for (yy, mm) in MONTHS:
+    month_start = pd.Timestamp(year=yy, month=mm, day=1)
+    month_end = month_start + pd.offsets.MonthEnd(1)  # daily series index at midnight -> OK
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(18, 7), sharex=True)
+
+    for p in PENETRATIONS:
+        ov_m = results[p]["ov_daily_h"].loc[month_start:month_end]
+        uv_m = results[p]["uv_daily_h"].loc[month_start:month_end]
+
+        ax1.plot(ov_m.index, ov_m.values, label=f"{int(p*100)}% PV")
+        ax2.plot(uv_m.index, uv_m.values, label=f"{int(p*100)}% PV")
+
+    ax1.set_title(f"Daily Overvoltage Duration (any LV bus > {OV_LIM} p.u.) — {month_start:%B %Y}")
+    ax1.set_ylabel("hours/day")
+    ax1.grid(True, linestyle=":", alpha=0.8)
+    ax1.legend(ncol=4, loc="upper right")
+
+    ax2.set_title(f"Daily Undervoltage Duration (any LV bus < {UV_LIM} p.u.) — {month_start:%B %Y}")
+    ax2.set_ylabel("hours/day")
+    ax2.grid(True, linestyle=":", alpha=0.8)
+    ax2.legend(ncol=4, loc="upper right")
+
+    ax2.set_xlim(month_start, month_end)
+    ax2.xaxis.set_major_locator(mdates.DayLocator(interval=2))
+    ax2.xaxis.set_major_formatter(mdates.DateFormatter("%d"))
+    ax2.set_xlabel(f"Day of month ({month_start:%b %Y})")
+
+    plt.tight_layout()
+    plt.show()
+
+    print(f"\n=== MONTH TOTALS: {month_start:%B %Y} ===")
+    for p in PENETRATIONS:
+        ov_total = results[p]["ov_daily_h"].loc[month_start:month_end].sum()
+        uv_total = results[p]["uv_daily_h"].loc[month_start:month_end].sum()
+        print(f"{int(p*100)}% PV -> OV: {ov_total:.2f} h, UV: {uv_total:.2f} h")
+
+# 10.3) Single house (guaranteed PV house) — 1 day
+_, chosen_60 = pv_bus_aggregate_for_penetration(0.60)
+rep_house = int(chosen_60[0])
+
+rep_load = LOAD_H[f"house_{rep_house}"].loc[mask_day]
+rep_pv   = PV_H[f"house_{rep_house}"].loc[mask_day]
+
+plt.figure(figsize=(18, 5))
+plt.plot(rep_load.index, rep_load.values, label="House load (MW)")
+plt.plot(rep_pv.index, rep_pv.values, label="House PV (MW)")
+plt.title(f"Single House — Load vs PV (Representative Day: {REP_DAY}, {FREQ})")
+plt.ylabel("Power (MW)")
+plt.xlabel("")
+plt.grid(True, linestyle=":", alpha=0.8)
+
+ax = plt.gca()
+apply_time_axis(ax, XAXIS_MODE)
+
+plt.legend(loc="upper right")
+plt.tight_layout()
+plt.show()
+
+# ==========================
+# 11) 3-MONTH TOTAL OV/UV (Jul+Aug+Sep)
+# ==========================
+print("\n=== 3-MONTH TOTALS (Jul–Sep 2025) ===")
+
+for month_start in ["2025-07-01", "2025-08-01", "2025-09-01"]:
+    m0 = pd.Timestamp(month_start)
+    m1 = (m0 + pd.offsets.MonthBegin(1))  # next month start
+    m_label = m0.strftime("%B %Y")
+
+    print(f"\n--- MONTH TOTALS: {m_label} ---")
+    for p in PENETRATIONS:
+        ov_m = results[p]["ov_daily_h"].loc[m0:m1 - pd.Timedelta(minutes=1)].sum()
+        uv_m = results[p]["uv_daily_h"].loc[m0:m1 - pd.Timedelta(minutes=1)].sum()
+        print(f"{int(p*100)}% PV -> OV: {ov_m:.2f} h, UV: {uv_m:.2f} h")
+
+print("\n--- TOTAL (Jul+Aug+Sep) ---")
+for p in PENETRATIONS:
+    ov_total = results[p]["ov_daily_h"].sum()
+    uv_total = results[p]["uv_daily_h"].sum()
+    print(f"{int(p*100)}% PV -> OV: {ov_total:.2f} h, UV: {uv_total:.2f} h")
