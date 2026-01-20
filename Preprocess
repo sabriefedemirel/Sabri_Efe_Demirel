@@ -1,0 +1,68 @@
+import numpy as np
+import pandas as pd
+
+CSV = "adanurban_lv_dataset.csv"
+TARGET = "over_voltage"      # veya "under_voltage"
+TEST_RATIO = 0.25            # son %25 zaman -> test
+VAL_RATIO  = 0.20            # train'in son %20'si -> validation
+FILTER_PV = None             # örn: 0.80 (sadece tek penetrasyon) veya None (hepsi)
+
+# 1) Load + clean
+df = pd.read_csv(CSV)
+df.columns = df.columns.str.strip()
+df["timestamp"] = pd.to_datetime(df["timestamp"])
+
+# 2) Sort (panel veri: aynı timestamp'te 4 penetrasyon var)
+sort_cols = ["timestamp", "pv_penetration"] if "pv_penetration" in df.columns else ["timestamp"]
+df = df.sort_values(sort_cols).reset_index(drop=True)
+
+# (Opsiyonel) sadece tek PV penetrasyonuyla çalış
+if FILTER_PV is not None:
+    df = df[np.isclose(df["pv_penetration"].astype(float), float(FILTER_PV))].copy()
+    df = df.sort_values("timestamp").reset_index(drop=True)
+    print("Filtered pv_penetration =", FILTER_PV, "| rows:", len(df))
+
+# 3) Step kontrol (5 dk mı?)
+dt_min = df["timestamp"].diff().dt.total_seconds().dropna() / 60.0
+if len(dt_min):
+    print("[Info] detected step (mode):", float(dt_min.mode().iloc[0]), "minutes")
+
+# 4) Feature set (NO leakage)
+LEAKAGE = {"lv0_v_pu", "vmin_lv_pu", "vmax_lv_pu"}
+base_candidates = [
+    "pv_penetration", "total_load_mw", "total_pv_mw", "net_injection_mw",
+    "poa_wm2", "temp_air_c", "temp_cell_c", "wind_mps"  # wind yoksa zaten alınmaz
+]
+FEATS = [c for c in base_candidates if c in df.columns and c not in LEAKAGE]
+
+# Time features
+df["hour"] = df["timestamp"].dt.hour + df["timestamp"].dt.minute / 60.0
+df["dow"] = df["timestamp"].dt.dayofweek
+df["is_weekend"] = (df["dow"] >= 5).astype(int)
+FEATS += ["hour", "dow", "is_weekend"]
+
+print("Using features:", FEATS)
+print("Target:", TARGET)
+
+# 5) Time split by UNIQUE timestamps
+ts = np.sort(df["timestamp"].unique())
+
+test_cut = ts[int(len(ts) * (1 - TEST_RATIO))]
+df_train_full = df[df["timestamp"] < test_cut].copy()
+df_test       = df[df["timestamp"] >= test_cut].copy()
+
+ts_train = np.sort(df_train_full["timestamp"].unique())
+val_cut = ts_train[int(len(ts_train) * (1 - VAL_RATIO))]
+df_train = df_train_full[df_train_full["timestamp"] < val_cut].copy()
+df_val   = df_train_full[df_train_full["timestamp"] >= val_cut].copy()
+
+print("\nSplit summary:")
+print("Train:", len(df_train), " Val:", len(df_val), " Test:", len(df_test))
+print("Pos-rate Train:", df_train[TARGET].mean(), "Val:", df_val[TARGET].mean(), "Test:", df_test[TARGET].mean())
+
+# 6) X/y hazır
+X_train, y_train = df_train[FEATS].astype(float).values, df_train[TARGET].astype(int).values
+X_val,   y_val   = df_val[FEATS].astype(float).values,   df_val[TARGET].astype(int).values
+X_test,  y_test  = df_test[FEATS].astype(float).values,  df_test[TARGET].astype(int).values
+
+print("\nShapes:", X_train.shape, X_val.shape, X_test.shape)
