@@ -1,0 +1,319 @@
+# ==========================================
+# ALL-IN-ONE (Option A): LightGBM + XGBoost + CNN1D
+# - Time-based split by UNIQUE timestamps: Train / Val / Test
+# - Threshold tuned on VALIDATION by F1 (NOT on test)
+# - No leakage: voltage cols are NOT features
+# - CNN sequences built within pv_penetration groups (panel-safe)
+# - Fair comparison: "aligned test" (trees evaluated on CNN label rows)
+# - Outputs: confusion matrices + metrics.csv (+ optional ROC inputs)
+# ==========================================
+
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from sklearn.metrics import (
+    confusion_matrix, f1_score,
+    accuracy_score, precision_score, recall_score
+)
+from sklearn.preprocessing import StandardScaler
+
+from lightgbm import LGBMClassifier
+from xgboost import XGBClassifier
+
+import tensorflow as tf
+from tensorflow.keras import layers, models
+
+# -----------------------------
+# SETTINGS
+# -----------------------------
+CSV = "adanurban_lv_dataset.csv"
+TARGET = "over_voltage"          # veya "under_voltage"
+TEST_RATIO = 0.25                # son %25 timestamp -> test
+VAL_RATIO  = 0.20                # train_full içinden son %20 timestamp -> val
+
+L = 48                           # 5dk veri için 48 adım = 4 saat
+FILTER_PV = None                 # None (tüm penetrasyonlar) veya 0.80 gibi
+
+OUT_DIR = "ml_outputs"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+SEED = 42
+np.random.seed(SEED)
+tf.random.set_seed(SEED)
+
+# -----------------------------
+# HELPERS
+# -----------------------------
+def best_threshold_by_f1(y_true, proba):
+    ths = np.linspace(0.05, 0.95, 19)
+    best_t, best_f = 0.5, -1
+    for t in ths:
+        yp = (proba >= t).astype(int)
+        f = f1_score(y_true, yp, zero_division=0)
+        if f > best_f:
+            best_f, best_t = f, t
+    return float(best_t), float(best_f)
+
+def metrics_dict(y_true, y_pred):
+    return {
+        "Accuracy": float(accuracy_score(y_true, y_pred)),
+        "Precision": float(precision_score(y_true, y_pred, zero_division=0)),
+        "Recall": float(recall_score(y_true, y_pred, zero_division=0)),
+        "F1": float(f1_score(y_true, y_pred, zero_division=0)),
+    }
+
+def plot_cm_01(y_true, y_pred, title):
+    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
+    plt.figure(figsize=(5.2, 4.6))
+    plt.imshow(cm, cmap="Blues")
+    plt.title(title)
+    plt.xlabel("Predicted")
+    plt.ylabel("True")
+    plt.xticks([0, 1], [0, 1])
+    plt.yticks([0, 1], [0, 1])
+
+    mx = cm.max() if cm.max() else 1
+    for (i, j), v in np.ndenumerate(cm):
+        plt.text(j, i, str(v), ha="center", va="center",
+                 color=("white" if v > 0.6 * mx else "black"))
+    plt.colorbar(label="Count")
+    plt.tight_layout()
+    plt.show()
+    return cm
+
+def time_split_by_timestamp(df, test_ratio, val_ratio):
+    """Split by UNIQUE timestamps: train / val / test."""
+    ts = np.sort(df["timestamp"].unique())
+
+    test_start = ts[int(len(ts) * (1 - test_ratio))]
+    df_train_full = df[df["timestamp"] < test_start].copy()
+    df_test = df[df["timestamp"] >= test_start].copy()
+
+    ts_train = np.sort(df_train_full["timestamp"].unique())
+    val_start = ts_train[int(len(ts_train) * (1 - val_ratio))]
+    df_train = df_train_full[df_train_full["timestamp"] < val_start].copy()
+    df_val   = df_train_full[df_train_full["timestamp"] >= val_start].copy()
+
+    return df_train, df_val, df_test
+
+def make_sequences_panel(df_part, feats, target, lookback, scaler):
+    """
+    Build sequences within each pv_penetration group (panel-safe).
+    Returns X_seq (N,L,F), y_seq (N,), idx_seq (label row indices in df_part)
+    """
+    X_all, y_all, idx_all = [], [], []
+
+    if "pv_penetration" in df_part.columns:
+        groups = df_part.groupby("pv_penetration", sort=True)
+    else:
+        groups = [(None, df_part)]
+
+    for _, g in groups:
+        g = g.sort_values("timestamp")
+        Xg = scaler.transform(g[feats].astype(float).values)
+        yg = g[target].astype(int).values
+        idxg = g.index.values
+
+        for i in range(lookback, len(g)):
+            X_all.append(Xg[i - lookback:i, :])
+            y_all.append(yg[i])
+            idx_all.append(idxg[i])
+
+    if len(X_all) == 0:
+        return np.empty((0, lookback, len(feats))), np.array([]), np.array([])
+
+    return np.array(X_all), np.array(y_all), np.array(idx_all)
+
+# -----------------------------
+# 1) LOAD + CLEAN
+# -----------------------------
+df = pd.read_csv(CSV)
+df.columns = [c.strip() for c in df.columns]   # kolon sonundaki boşlukları temizler
+df["timestamp"] = pd.to_datetime(df["timestamp"])
+df = df.sort_values(["timestamp", "pv_penetration"] if "pv_penetration" in df.columns else ["timestamp"]).reset_index(drop=True)
+
+if TARGET not in df.columns:
+    raise ValueError(f"TARGET not found: {TARGET}. Available columns:\n{df.columns.tolist()}")
+
+if FILTER_PV is not None:
+    if "pv_penetration" not in df.columns:
+        raise ValueError("FILTER_PV set but pv_penetration column is missing.")
+    df = df[np.isclose(df["pv_penetration"].astype(float), float(FILTER_PV))].copy()
+    df = df.sort_values("timestamp").reset_index(drop=True)
+    print(f"[Info] FILTER_PV={FILTER_PV} applied. Rows={len(df)}")
+
+# step kontrol (bilgi amaçlı)
+dt_min = df["timestamp"].sort_values().diff().dt.total_seconds().dropna() / 60.0
+if len(dt_min) > 0:
+    print(f"[Info] Detected step ~ {float(dt_min.mode().iloc[0]):.1f} minutes")
+
+# -----------------------------
+# 2) FEATURES (NO LEAKAGE)
+# -----------------------------
+LEAKAGE = {"lv0_v_pu", "vmin_lv_pu", "vmax_lv_pu"}  # varsa feature'a sokma
+
+base = [
+    "pv_penetration", "total_load_mw", "total_pv_mw", "net_injection_mw",
+    "poa_wm2", "temp_air_c", "temp_cell_c", "wind_mps"
+]
+FEATS = [c for c in base if c in df.columns and c not in LEAKAGE]
+
+df["hour"] = df["timestamp"].dt.hour + df["timestamp"].dt.minute / 60.0
+df["dow"] = df["timestamp"].dt.dayofweek
+df["is_weekend"] = (df["dow"] >= 5).astype(int)
+FEATS += ["hour", "dow", "is_weekend"]
+
+print("Using features:", FEATS)
+print("Target:", TARGET)
+
+# -----------------------------
+# 3) TIME SPLIT (Train/Val/Test)
+# -----------------------------
+df_train, df_val, df_test = time_split_by_timestamp(df, TEST_RATIO, VAL_RATIO)
+
+print("\nSplit summary:")
+print(f"Train: {len(df_train)}  Val: {len(df_val)}  Test: {len(df_test)}")
+print(f"Pos-rate Train: {df_train[TARGET].mean():.4f}  Val: {df_val[TARGET].mean():.4f}  Test: {df_test[TARGET].mean():.4f}")
+
+# -----------------------------
+# 4) TREE MODELS (LightGBM + XGBoost) with VAL threshold
+# -----------------------------
+Xtr = df_train[FEATS].astype(float).values
+ytr = df_train[TARGET].astype(int).values
+
+Xva = df_val[FEATS].astype(float).values
+yva = df_val[TARGET].astype(int).values
+
+Xte = df_test[FEATS].astype(float).values
+yte = df_test[TARGET].astype(int).values
+
+# LightGBM
+lgbm = LGBMClassifier(
+    n_estimators=500, learning_rate=0.05,
+    num_leaves=31, subsample=0.9, colsample_bytree=0.9,
+    class_weight="balanced", random_state=SEED
+)
+lgbm.fit(Xtr, ytr)
+lgbm_va_proba = lgbm.predict_proba(Xva)[:, 1]
+t_lgbm, f_lgbm = best_threshold_by_f1(yva, lgbm_va_proba)
+
+# XGBoost
+pos = (ytr == 1).sum()
+neg = (ytr == 0).sum()
+scale_pos_weight = neg / max(pos, 1)
+
+xgb = XGBClassifier(
+    n_estimators=700, learning_rate=0.05, max_depth=5,
+    subsample=0.9, colsample_bytree=0.9, reg_lambda=1.0,
+    random_state=SEED, eval_metric="logloss",
+    scale_pos_weight=scale_pos_weight
+)
+xgb.fit(Xtr, ytr)
+xgb_va_proba = xgb.predict_proba(Xva)[:, 1]
+t_xgb, f_xgb = best_threshold_by_f1(yva, xgb_va_proba)
+
+# -----------------------------
+# 5) CNN1D (panel-safe sequences) with VAL threshold
+# -----------------------------
+scaler = StandardScaler()
+scaler.fit(df_train[FEATS].astype(float).values)  # sadece train ile fit
+
+Xtr_seq, ytr_seq, idx_tr = make_sequences_panel(df_train, FEATS, TARGET, L, scaler)
+Xva_seq, yva_seq, idx_va = make_sequences_panel(df_val,   FEATS, TARGET, L, scaler)
+Xte_seq, yte_seq, idx_te = make_sequences_panel(df_test,  FEATS, TARGET, L, scaler)
+
+print("\nCNN shapes:")
+print("Train seq:", Xtr_seq.shape, "Val seq:", Xva_seq.shape, "Test seq:", Xte_seq.shape)
+
+# class weight
+pos2 = (ytr_seq == 1).sum()
+neg2 = (ytr_seq == 0).sum()
+cw = {0: 1.0, 1: float(neg2 / max(pos2, 1))}
+
+cnn = models.Sequential([
+    layers.Input(shape=(L, len(FEATS))),
+    layers.Conv1D(32, 3, activation="relu", padding="same"),
+    layers.Conv1D(32, 3, activation="relu", padding="same"),
+    layers.GlobalAveragePooling1D(),
+    layers.Dense(32, activation="relu"),
+    layers.Dense(1, activation="sigmoid"),
+])
+cnn.compile(optimizer=tf.keras.optimizers.Adam(1e-3), loss="binary_crossentropy")
+
+# EarlyStopping = gerçekçiliği artırır (overfit'i azaltır)
+cb = [tf.keras.callbacks.EarlyStopping(monitor="val_loss", patience=2, restore_best_weights=True)]
+
+cnn.fit(
+    Xtr_seq, ytr_seq,
+    validation_data=(Xva_seq, yva_seq) if len(yva_seq) else None,
+    epochs=12, batch_size=256,
+    verbose=1,
+    class_weight=cw,
+    callbacks=cb if len(yva_seq) else None
+)
+
+cnn_va_proba = cnn.predict(Xva_seq, verbose=0).ravel() if len(yva_seq) else cnn.predict(Xtr_seq, verbose=0).ravel()
+t_cnn, f_cnn = best_threshold_by_f1(yva_seq if len(yva_seq) else ytr_seq, cnn_va_proba)
+
+cnn_test_proba = cnn.predict(Xte_seq, verbose=0).ravel()
+cnn_test_pred  = (cnn_test_proba >= t_cnn).astype(int)
+
+# -----------------------------
+# 6) ALIGNED TEST (trees evaluated on CNN label rows)
+# -----------------------------
+# CNN test sequence'lerin label satırları df_test içindeki idx_te indekslerinde
+df_test_aligned = df_test.loc[idx_te].copy()
+Xte_al = df_test_aligned[FEATS].astype(float).values
+y_test_aligned = df_test_aligned[TARGET].astype(int).values
+
+lgbm_test_proba_al = lgbm.predict_proba(Xte_al)[:, 1]
+lgbm_test_pred_al  = (lgbm_test_proba_al >= t_lgbm).astype(int)
+
+xgb_test_proba_al = xgb.predict_proba(Xte_al)[:, 1]
+xgb_test_pred_al  = (xgb_test_proba_al >= t_xgb).astype(int)
+
+print("\nThresholds (from VALIDATION):")
+print(f" LightGBM: {t_lgbm:.3f} (Val F1={f_lgbm:.4f})")
+print(f" XGBoost : {t_xgb:.3f} (Val F1={f_xgb:.4f})")
+print(f" CNN1D   : {t_cnn:.3f} (Val F1={f_cnn:.4f})")
+
+# -----------------------------
+# 7) METRICS + CONFUSION MATRICES (0/1)
+# -----------------------------
+rows = []
+
+# LightGBM (aligned test)
+rows.append({"Model":"LightGBM", **metrics_dict(y_test_aligned, lgbm_test_pred_al)})
+plot_cm_01(y_test_aligned, lgbm_test_pred_al, "Confusion Matrix — LightGBM ")
+
+# XGBoost (aligned test)
+rows.append({"Model":"XGBoost", **metrics_dict(y_test_aligned, xgb_test_pred_al)})
+plot_cm_01(y_test_aligned, xgb_test_pred_al, "Confusion Matrix — XGBoost ")
+
+# CNN (its own aligned test already)
+rows.append({"Model":"CNN", **metrics_dict(yte_seq, cnn_test_pred)})
+plot_cm_01(yte_seq, cnn_test_pred, "Confusion Matrix — CNN ")
+
+metrics_df = pd.DataFrame(rows)
+print("\n=== TEST METRICS (Aligned) ===")
+print(metrics_df.to_string(index=False))
+
+metrics_path = os.path.join(OUT_DIR, "metrics.csv")
+metrics_df.to_csv(metrics_path, index=False)
+print(f"\nSaved metrics: {metrics_path}")
+
+# -----------------------------
+# 8) SAVE (optional ROC inputs later)
+# -----------------------------
+pd.DataFrame({"y": y_test_aligned}).to_csv(os.path.join(OUT_DIR, "y_test_aligned.csv"), index=False)
+pd.DataFrame({"p": lgbm_test_proba_al}).to_csv(os.path.join(OUT_DIR, "proba_lightgbm.csv"), index=False)
+pd.DataFrame({"p": xgb_test_proba_al}).to_csv(os.path.join(OUT_DIR, "proba_xgboost.csv"), index=False)
+pd.DataFrame({"p": cnn_test_proba}).to_csv(os.path.join(OUT_DIR, "proba_cnn.csv"), index=False)
+
+print("\nSaved probability outputs into:", OUT_DIR)
+print(" - y_test_aligned.csv")
+print(" - proba_lightgbm.csv")
+print(" - proba_xgboost.csv")
+print(" - proba_cnn.csv")
